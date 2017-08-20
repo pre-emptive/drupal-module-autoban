@@ -1,0 +1,158 @@
+<?php
+
+// $Id: autoban.install,v 1.10 2008/11/12 11:44:26 ralph Exp $
+
+// (C)2008 Pre-Emptive Limited. http://www.pre-emptive.net
+// GNU Public Licenced (v2)
+// Written by Ralph Bolton, September 2008
+
+/**
+ * Implementation of hook_install.
+ * @param none
+ * @return none
+ */
+function autoban_install() {
+  // Set a  random path for reverse-Turing Test responses to go
+  require_once('autoban.module');
+  $key = _autoban_random_string(rand(5,15), TRUE);
+  variable_set('autoban_tt_path', '_autoban/' . $key);
+
+  drupal_install_schema('autoban');
+}
+
+/**
+ * Implementation of hook_uninstall.
+ * @param none
+ * @return none
+ */
+function autoban_uninstall() {
+  // We should probably run through autoban_targets and remove
+  // then from the {access} table so that they don't remain
+  // permanently banned!
+  foreach (array(
+    'autoban_enabled',
+    'autoban_create_rules',
+    'autoban_time_threshold',
+    'autoban_last_max_rows',
+    'autoban_max_hits_threshold',
+    'autoban_incremental',
+    'autoban_ban_time',
+    'autoban_beacon_enabled',
+    'autoban_beacon_score_threshold',
+    'autoban_beacon_ban_time',
+    'autoban_tt_displays',
+    'autoban_tt_attempts',
+    'autoban_tt_challenge',
+    'autoban_tt_path',
+    'autoban_tt_ban_time',
+    'autoban_tt_pass_time',
+    'autoban_subnet_detect_enabled',
+    'autoban_subnet_size',
+    'autoban_subnet_offender_threshold',
+    'autoban_subnet_lookback_time',
+    'autoban_subnet_ban_time',
+    'autoban_mollom_enabled',
+    'autoban_mollom_events',
+    'autoban_mollom_lookback_time',
+    'autoban_mollom_ban_time',
+  ) as $item) {
+    variable_del($item);
+  }
+  drupal_uninstall_schema('autoban');
+}
+
+function autoban_schema() {
+  $schema = array();
+  $schema['autoban_targets'] = array(
+    'fields' => array(
+      'aid' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'created' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'expires' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'uid' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'notes' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+    ),
+    'primary key' => array('aid'),
+    'unique keys' => array('autoban_aid' => array('aid')),
+  );
+
+  $schema['autoban_log'] = array(
+    'fields' => array(
+      'lid' => array('type' => 'serial', 'unsigned' => TRUE, 'not null' => TRUE),
+      'timestamp' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'mask' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'uid' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'xid' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'type' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'status' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'expires' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'reason' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'notes' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+    ),
+    'primary key' => array('lid'),
+  );
+
+  $schema['autoban_hitlist'] = array(
+    'fields' => array(
+      'hid' => array('type' => 'serial', 'unsigned' => TRUE, 'not null' => TRUE),
+      'mask' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'remaining' => array('type' => 'int', 'unsigned' => FALSE, 'default' => 0, 'not null' => TRUE),
+      'triesleft' => array('type' => 'int', 'unsigned' => FALSE, 'default' => 0, 'not null' => TRUE),
+      'challenge' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'question' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'answer' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'magickey' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'timestamp' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+    ),
+    'primary key' => array('hid'),
+  );
+
+  return $schema;
+}
+
+function autoban_update_1106() {
+  // Set a  random path for reverse-Turing Test responses to go
+  require_once('autoban.module');
+  $key = _autoban_random_string(rand(5,15), TRUE);
+  variable_set('autoban_tt_path', '_autoban/' . $key);
+
+  $schema['autoban_hitlist'] = array(
+    'fields' => array(
+      'hid' => array('type' => 'serial', 'unsigned' => TRUE, 'not null' => TRUE),
+      'mask' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'remaining' => array('type' => 'int', 'unsigned' => FALSE, 'default' => 0, 'not null' => TRUE),
+      'triesleft' => array('type' => 'int', 'unsigned' => FALSE, 'default' => 0, 'not null' => TRUE),
+      'challenge' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+      'question' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'answer' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'magickey' => array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''),
+      'timestamp' => array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE),
+    ),
+    'primary key' => array('hid'),
+    'unique keys' => array('autoban_hitlist_masks' => array('mask')),
+    'indexes' => array('autoban_hitlist_masks_index' => array('mask')),
+  );
+  $ret = array();
+  db_create_table($ret, 'autoban_hitlist', $schema['autoban_hitlist']);
+  return $ret;
+}
+
+function autoban_update_1111() {
+  $ret = array();
+  
+  db_add_field($ret, 'autoban_log', 'type', array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''));
+  db_add_field($ret, 'autoban_log', 'status', array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE));
+  db_add_field($ret, 'autoban_log', 'expires', array('type' => 'varchar', 'length' => 255, 'not null' => TRUE, 'default' => ''));
+  return $ret;
+}
+
+function autoban_update_1112() {
+  $ret = array();
+  db_add_field($ret, 'autoban_log', 'reason', array('type' => 'int', 'unsigned' => TRUE, 'default' => 0, 'not null' => TRUE));
+  return $ret;
+}
+
+
+
+
+// The following line is for Vim users - please don't delete it.
+// vim: set filetype=php expandtab tabstop=2 shiftwidth=2:

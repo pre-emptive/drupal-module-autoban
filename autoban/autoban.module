@@ -1,0 +1,538 @@
+<?php
+
+// $Id: autoban.module,v 1.13 2008/11/05 13:12:15 ralph Exp $
+
+// (C)2008 Pre-Emptive Limited. http://www.pre-emptive.net
+// GNU Public Licenced (v2)
+// Written by Ralph Bolton, September 2008
+
+// autoban.module - Ban users (IPs) automatically
+
+define('AUTOBAN_PLAIN_LINK', 1);
+define('AUTOBAN_JS_LINK', 2);
+define('AUTOBAN_PLAIN_IMAGE', 3);
+define('AUTOBAN_JS_IMAGE', 4);
+define('AUTOBAN_SIMPLE_MATHS', 5);
+define('AUTOBAN_RECAPTCHA', 6);
+
+define('AUTOBAN_RECAPTCHA_LIBRARY', 'recaptcha-php-1.10');
+
+define('AUTOBAN_REASON_UNDEF', 0);
+define('AUTOBAN_REASON_MANUAL', 1);
+define('AUTOBAN_REASON_OVER_LIMIT', 128 + 2);
+define('AUTOBAN_REASON_FAILED_CHALLENGE', 128+ 3);
+define('AUTOBAN_REASON_IGNORED_CHALLENGE', 128 + 4);
+define('AUTOBAN_REASON_PASSED_CHALLENGE', 5);
+define('AUTOBAN_REASON_CHALLENGE_ISSUED', 6);
+define('AUTOBAN_REASON_SUBNET', 128 + 7);
+define('AUTOBAN_REASON_REPEAT', 128 + 8);
+define('AUTOBAN_REASON_BEACON', 128 + 9);
+define('AUTOBAN_REASON_DUPLICATE',10);
+define('AUTOBAN_REASON_MOLLOM', 128 + 11);
+
+/**
+ * Display help and module information
+ * @param section which section of the site we're displaying help 
+ * @return help text for section
+ */
+function autoban_help($section='') {
+  $output = '';
+
+  switch ($section) {
+    case "admin/help#autoban":
+      break;
+  }
+
+  return $output;
+} // function autoban_help
+
+// hook_boot()
+// This is *super* performance sensitive, because it's called on *every* page
+// load, even cached pages. As a result, we've got a highly optimised DB
+// table and SQL, and we trim this function to the bare minimum unless the
+// visitor is on the hitlist.
+function autoban_boot() {
+  $mask = ip_address();
+  // This select is on an indexed, unique column. Hopefully it'll go quick ;-)
+  $hitlist = db_result(db_query("SELECT hid FROM {autoban_hitlist} WHERE mask='%s'", $mask));
+
+  if($hitlist) {
+    // Stuff inside this if() is still performance critical, but much less
+    // than outside, because this stuff is only used if the visitor is on
+    // the hitlist.
+    $path = variable_get('autoban_tt_path', '_autoban');
+    if(isset($_REQUEST['q']) && substr($_REQUEST['q'], 0, strlen($path)) == $path) {
+      // This is a request to the TT receiver - let it through unmolested.
+      // The TT receiver will either count this as an attempt to respond to
+      // the challenge, or else will tell Statistics to log it as a page view
+      return;
+    }
+
+    // Decrement the available page views this visitor has left
+    db_query('UPDATE {autoban_hitlist} SET remaining=remaining-1, timestamp=%d WHERE hid=%d', time(), $hitlist);
+
+    // Now fetch our data to see if we need banning (and to get info
+    // for issuing our challenge, if we need to do that)
+    $result = db_query('SELECT * FROM {autoban_hitlist} WHERE hid=%d', $hitlist);
+    $row = db_fetch_object($result);
+
+    if($row->remaining <= 0) {
+      // This person needs banning ;-)
+      $ban_time = time() + variable_get('autoban_tt_ban_time', 86400);
+      $displays = variable_get('autoban_tt_displays', 10);
+      // t() and format_plural not available!!
+      $notes = 'Failed to answer challenge ' . $displays . ' times';
+      autoban_add_rule(array('expires' => $ban_time, 'mask' => $mask, 'reason' => AUTOBAN_REASON_IGNORED_CHALLENGE, 'notes' => $notes, 'status' => 0));
+      db_query('DELETE FROM {autoban_hitlist} WHERE hid=%d', $hitlist);
+
+      // Now show them that they've been banned
+      header('HTTP/1.1 403 Forbidden');
+      print 'Sorry, '. check_plain($mask) .' has just been banned.';
+
+      // and exit quickly
+      exit;
+    }
+
+    require_once('lib/autoban.challenges.inc');
+    autoban_issue_challenge($row);
+
+    // Now exit quickly
+    exit;
+  }
+}
+
+/**
+ * Implementation of hook_perm. This module doesn't really use permissions much.
+ * @param none
+ * @return an array of permissions
+ */
+function autoban_perm() {
+  return array('administer autoban module');
+} // function autoban_perm()
+
+/** 
+ * Implementation of hook_menu. Only one menu item is provided as a link to block settings
+ * @param may_cache
+ * @return an array manu items
+ */
+function autoban_menu() {
+  $items = array();
+  $items['admin/user/rules/edit'] = array(
+    'title' => 'Edit rule',
+    'page callback' => 'autoban_user_rules_edit',
+    'access arguments' => array('administer permissions'),
+    'type' => MENU_CALLBACK,
+    'file' => 'autoban.access.inc',
+  );
+  $items['admin/user/rules/add'] = array(
+    'title' => 'Add rule',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('autoban_admin_user_rules_form'),
+    'access arguments' => array('administer permissions'),
+    'file' => 'autoban.access.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+  $items['admin/user/rules'] = array(
+    'title' => 'Access rules',
+    'description' => 'List and create rules to disallow usernames, e-mail addresses, and IP addresses.',
+    'page callback' => 'autoban_list_rules',
+    'access arguments' => array('administer permissions'),
+    'file' => 'autoban.access.inc',
+  );
+  $items['admin/user/rules/list'] = array(
+    'title' => 'List',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10,
+  );
+
+  $items['admin/settings/autoban'] = array(
+    'title' => 'Autoban',
+    'description' => 'Configure the Autoban module',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('autoban_admin_settings_form'),
+    'access arguments' => array('administer autoban module'),
+    'file' => 'autoban.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['admin/reports/autoban'] = array(
+    'title' => 'Autoban',
+    'description' => 'View Autoban activity log',
+    'page callback' => 'autoban_admin_view_log',
+    'access arguments' => array('administer autoban module'),
+    'file' => 'autoban.admin.inc',
+  );
+  $items['admin/reports/autoban/log'] = array(
+    'title' => 'Log',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10,
+  );
+  $items['admin/reports/autoban/current'] = array(
+    'title' => 'Current Activity',
+    'description' => 'View current Activity',
+    'page callback' => 'autoban_admin_view_current_activity',
+    'access arguments' => array('administer autoban module'),
+    'file' => 'autoban.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+  $items['admin/reports/autoban/challenges'] = array(
+    'title' => 'Current Challenges',
+    'description' => 'View current challenges',
+    'page callback' => 'autoban_admin_view_current_challenges',
+    'access arguments' => array('administer autoban module'),
+    'file' => 'autoban.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+  // We put the Turing Test receiver in a random path name.
+  // We only really set this once, and it's just a way to stop
+  // autobots globally spamming autoban. It isn't secure, because
+  // all a bot needs to do is get banned, be asked to make a
+  // Turing Test, then go ahead and spam that URL all it wants.
+  // This is just so that bots can't work across sites too easily.
+  $path = variable_get('autoban_tt_path', '_autoban');
+  $items[$path] = array(
+    'page callback' => 'autoban_tt_receiver',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implementation of hook_cron
+ * @param none
+ * @return none
+ */
+function autoban_cron() {
+  include_once('autoban.cron.inc');
+  return _autoban_cron(variable_get('autoban_enabled',0), variable_get('autoban_create_rules',0));
+      
+}
+
+function autoban_log($notes = '', $aid = 0, $mask = '', $hid = 0) {
+  global $user;
+  $result = db_query("INSERT INTO {autoban_log} (timestamp, mask, uid, aid, hid, notes) VALUES (%d, '%s', %d, %d, '%s')", time(), $mask, $user->uid, $aid, $hid, $notes);
+}
+
+function old_autoban_add_rule($expires = 0, $mask = '1.1.1.1', $type = 'host', $status = 0, $notes = '', $minimal = 0) {
+  global $user;
+
+  $aid = db_result(db_query("SELECT aid FROM {access} WHERE mask='%s' AND type='%s' AND status=%d", $mask, $type, $status));
+
+  if($aid) {
+    // Rule already exists
+    $msg = "Rule for $type $mask already exists, not adding a duplicate";
+    //autoban_log("Rule for $type $mask already exists, not adding a duplicate", $aid);
+    db_query("INSERT INTO {autoban_log} (timestamp,mask,uid,aid,hid,type,status,expires,notes) VALUES (%d, '%s', %d,%d,%d, '%s', %d, %d, '%s')", time(), $mask, $user->uid, $aid, 0, $type, $status, 0, $msg);
+  } else {
+    // If the expiry is not in the future, then we don't actually add a rule, we just say we did.
+    // in other words, we add and expire at the same moment ;-)
+    if($expires == 0 || $expires > time()) {
+      // Insert the IP into the access table 'willy nilly' ;-)
+      $result = db_query("INSERT INTO {access} (mask,type,status) VALUES ('%s', '%s', %d)", $mask, $type, $status);
+      // now get the AID from the last query, and insert it into the autoban_targets table...
+      $aid = db_last_insert_id('{access}', 'aid');
+
+      $result = db_query("INSERT INTO {autoban_targets} (aid, created, expires, uid, notes) VALUES (%d, %d, %d, %d, '%s')", $aid, time(), $expires, $user->uid, $notes);
+    }
+
+    $msg = '';
+
+    if($minimal) {
+      // If we're minimal, we can't use t() or format_date() because
+      // we're running through hook_boot() which hasn't loaded them
+      // yet. So we drop to basic format log messages
+      $info = $status ? 'allowed' : 'denied';
+      $msg = "$type $mask $info ($notes)";
+      //autoban_log($msg, $aid, $mask);
+    } else {
+      // Go full-fat - we've got all functions available
+      $info = $status ? t('allowed') : t('denied');
+
+      if($expires) {
+        $until = 'until ' . format_date($expires, 'small');
+      } else {
+        $until = 'for ever';
+      }
+      $msg = "$type $mask $info $until ($notes)";
+      //autoban_log($msg, $aid, $mask);
+    }
+    db_query("INSERT INTO {autoban_log} (timestamp,mask,uid,aid,hid,type,status,expires,notes) VALUES (%d, '%s', %d,%d,%d, '%s', %d, %d, '%s')", time(), $mask, $user->uid, $aid, $hid, $type, $status, $expires, $msg);
+  }
+  // No matter what we've done, make sure we remove this IP from the hitlist
+  db_query("DELETE FROM {autoban_hitlist} WHERE mask='%s'", $mask);
+}
+
+function autoban_add_rule($options = array()) {
+  global $user;
+  $now = time();
+  $defaults =  array( 'mask' => '1.1.1.1',
+                      'expires' => $now,
+                      'type' => 'host',
+                      'aid' => 0,
+                      'cid' => 0,
+                      'status' => 0,
+                      'reason' => AUTOBAN_REASON_UNDEF,
+                      'minimal' => 0,
+                      'notes' => '',
+  );
+  // Also has timestamp and uid (but not in options)
+
+  // Set up options and defaults...
+  foreach(array_keys($defaults) as $key) {
+    if(!isset($options[$key])) {
+      $options[$key] = $defaults[$key];
+    }
+  }
+
+  // check to see if the rule already exists...
+  $aid = db_result(db_query("SELECT aid FROM {access} WHERE mask='%s' AND type='%s' AND status=%d", $options['mask'], $options['type'], $options['status']));
+
+  if($aid) {
+    // Rule already exists
+    // Just log, then do nothing else
+    $options['reason'] = AUTOBAN_REASON_DUPLICATE;
+
+    db_query("INSERT INTO {autoban_log} (timestamp,mask,uid,xid,type,status,expires,reason,notes) VALUES (%d,'%s',%d,%d,'%s',%d,%d,%d,'%s')", $now, $options['mask'], $user->uid, 0, $options['type'], $options['status'], $options['expires'], $options['reason'], '');
+    return;
+
+  } else {
+    // If the expiry is not in the future, then we don't actually add a rule, we just say we did.
+    // in other words, we add and expire at the same moment ;-)
+    if($options['expires'] == 0 || $options['expires'] > $now) {
+      // Insert the IP into the access table 'willy nilly' ;-)
+      $result = db_query("INSERT INTO {access} (mask,type,status) VALUES ('%s', '%s', %d)", $options['mask'], $options['type'], $options['status']);
+      // now get the AID from the last query, and insert it into the autoban_targets table...
+      $aid = db_last_insert_id('{access}', 'aid');
+
+      $result = db_query("INSERT INTO {autoban_targets} (aid, created, expires, uid, notes) VALUES (%d, %d, %d, %d, '%s')", $aid, time(), $options['expires'], $user->uid, $options['notes']);
+    }
+  }
+
+  // To be here, we've added a rule to Autoban. Now log it...
+
+  db_query("INSERT INTO {autoban_log} (timestamp,mask,uid,xid,type,status,expires,reason,notes) VALUES (%d,'%s',%d,%d,'%s',%d,%d,%d,'%s')", $now, $options['mask'], $user->uid, $aid, $options['type'], $options['status'], $options['expires'], $options['reason'], $options['notes']);
+  
+}
+
+function autoban_challenge($mask = '1.1.1.1', $notes = '') {
+  global $user;
+  // Now we must make a challenge
+  $challenge = variable_get('autoban_tt_challenge', 0);
+  if(!$challenge) {
+    // If challenge is disabled, then do nothing
+    return;
+  }
+  $remaining = variable_get('autoban_tt_displays', 10);
+  $triesleft = variable_get('autoban_tt_attempts', 3);
+  $question = '';
+  $answer = '';
+  $magickey = _autoban_random_string(rand(10,25), TRUE);
+
+  // All challenges use a magic key
+  // Only a couple need anything extra
+  switch($challenge) {
+    case AUTOBAN_SIMPLE_MATHS:
+      // decide on an operation
+      $operation = rand(0,1);
+      $one = rand(1,5);
+      $two = rand(1,5);
+      if($operation == 1) {
+        $one = $one + 5;
+        $question = "$one - $two";
+        $answer = $one - $two;
+      } else {
+        $question = "$one + $two";
+        $answer = $one + $two;
+      }
+      break;
+  }
+
+  // Now add this IP to the hitlist. This may fail because of unique constraints.
+  // We actually want that - that way the oldest entry takes precidence and we
+  // don't keep refreshing an entry or anything daft like that.
+  db_query("INSERT INTO {autoban_hitlist} (mask,remaining,triesleft,challenge,question,answer,magickey,timestamp) VALUES ('%s', %d, %d, %d, '%s', '%s', '%s', %d)", $mask, $remaining, $triesleft, $challenge, $question, $answer, $magickey, time());
+  $hid = db_last_insert_id('{autoban_hitlist}', 'hid');
+  // Log what we've done
+  db_query("INSERT INTO {autoban_log} (timestamp,mask,uid,xid,type,status,expires,reason,notes) VALUES (%d,'%s',%d,%d,'%s',%d,%d,%d,'%s')", time(), $mask, $user->uid, $hid, 'host', 0, 0, AUTOBAN_REASON_CHALLENGE_ISSUED, $notes);
+}
+
+function autoban_is_challenged($mask = '1.1.1.1') {
+  return db_result(db_query("SELECT 1 FROM {autoban_hitlist} WHERE mask='%s'", $mask));
+}
+
+function autoban_is_denied($type, $mask) {
+
+  $sql = "SELECT 1 FROM {access} WHERE type = '%s' AND LOWER('%s') LIKE LOWER(mask) AND status = %d";
+  $allowed = db_result(db_query_range($sql, $type, $mask, 1, 0, 1));
+  if($allowed) {
+    return 0;
+  }
+  $denied = db_result(db_query_range($sql, $type, $mask, 0, 0, 1));
+  if($denied) {
+    return 1;
+  } else {
+    return NULL;
+  }
+}
+
+// autoban_tt_reciever()
+// This function "receives" challenge responses. If the IP calling us
+// is a targetted IP, then we count any requests here against their quota of
+// allowed responses (when they run out, we ban the IP). If the user is not
+// targetted, we return 404 "page not found", which Statistics will count as a
+// page view, and so will add to the IPs quota of page views per unit time.
+function autoban_tt_receiver() {
+  $mask = ip_address();
+  // This select is on an indexed, unique column. Hopefully it'll go quick ;-)
+  $result = db_query("SELECT * FROM {autoban_hitlist} WHERE mask='%s'", $mask);
+  $row = db_fetch_object($result);
+
+  if($row->hid) {
+    // Stuff inside here is for people on the hitlist. Anyone else gets "404"
+
+    $args = func_get_args();
+
+    // Now see if the response to the challenge was correct
+    $failed_challenge = 1;
+
+    switch($row->challenge) {
+      case AUTOBAN_PLAIN_LINK:
+      case AUTOBAN_JS_LINK:
+        // The user needs to GET our path/magickey. If they've done that,
+        // they pass the test
+        $user_key = implode('/', $args);
+        if($user_key == $row->magickey) {
+          // user has passed the test
+          $failed_challenge = 0;
+        }
+        break;
+      case AUTOBAN_PLAIN_IMAGE:
+      case AUTOBAN_JS_IMAGE:
+        // In the image case, the user must GET our path/magic key,
+        // but in this case, we return a 1x1 GIF image. This unblocks
+        // them, so their next request will succeed (which occurs because
+        // of a meta-refresh
+        $user_key = implode('/', $args);
+        if($user_key == $row->magickey) {
+          // user has passed the test
+          $failed_challenge = 0;
+          // Tell the browser it's an image, and tell them not to keep it
+          header('Content-type: image/gif');
+          header('Cache-Control: no-cache, no-store, must-revalidate');
+          // This is a 1x1 blank gif image
+          print chr(71).chr(73).chr(70).chr(56).chr(57).chr(97).chr(1).chr(0).chr(1).chr(0).chr(128).chr(0).chr(0).chr(255).chr(255).chr(255).chr(255).chr(255).chr(255).chr(33).chr(249).chr(4).chr(1).chr(10).chr(0).chr(1).chr(0).chr(44).chr(0).chr(0).chr(0).chr(0).chr(1).chr(0).chr(1).chr(0).chr(0).chr(2).chr(2).chr(76).chr(1).chr(0).chr(59);
+        }
+        break;
+      case AUTOBAN_SIMPLE_MATHS:
+        // For maths questions, we've got to receive the magic key, and
+        // the right answer to the simple question we asked.
+        $user_key = implode('/', $args);
+        if($user_key == $row->magickey) {
+          // We have the magic key, which is a good start!
+          if(isset($_REQUEST['answer'])) {  
+            // User has supplied an answer...
+            if($_REQUEST['answer'] == $row->answer) {
+              // Test passed!
+              $failed_challenge = 0;
+            }
+          }
+        }
+        break;
+      case AUTOBAN_RECAPTCHA:
+        require_once('lib/' . AUTOBAN_RECAPTCHA_LIBRARY . '/recaptchalib.php');
+        $privatekey = variable_get('autoban_recaptcha_privatekey', '');
+        $resp = recaptcha_check_answer ($privatekey,
+                                $_SERVER["REMOTE_ADDR"],
+                                $_POST["recaptcha_challenge_field"],
+                                $_POST["recaptcha_response_field"]);
+        if ($resp->is_valid) {
+          // They've successfully entered the recaptcha
+          $failed_challenge = 0;
+        }
+        break;
+      // Anything else is not supported, so counts as a failure
+    }
+
+    if($failed_challenge) {
+      // Decrement the available page views this visitor has left
+      db_query('UPDATE {autoban_hitlist} SET triesleft=triesleft-1, timestamp=%d WHERE hid=%d', time(), $row->hid);
+
+      // We've decremented trieslist since last reading it. This if() takes that into account
+      if($row->triesleft <= 1) {
+        // This person needs banning ;-)
+        $ban_time = time() + variable_get('autoban_tt_ban_time', 86400);
+        $attempts = variable_get('autoban_tt_attempts', 3);
+        $notes = t('Incorrectly answered challenge @num', array('@num' => format_plural($attempts, '1 time', '@count times')));
+        autoban_add_rule(array('expires' => $ban_time, 'mask' => $mask, 'reason' => AUTOBAN_REASON_FAILED_CHALLENGE, 'notes' => $notes, 'status' => 0));
+        db_query('DELETE FROM {autoban_hitlist} WHERE hid=%d', $hitlist);
+
+        // Now show them that they've been banned
+        header('HTTP/1.1 403 Forbidden');
+        print 'Sorry, '. check_plain($mask) .' has just been banned.';
+
+        // and exit quickly
+        exit;
+      }
+    } else {
+      // This user has passed the test. Remove them from the hitlist
+      // whitelist them for however long we've been configured to do
+      db_query('DELETE FROM {autoban_hitlist} WHERE hid=%d', $row->hid);
+
+      // whitelist them...
+      $white_time = time() + variable_get('autoban_tt_pass_time', 900);
+      $notes = t('Successfully passed challenge');
+      autoban_add_rule(array('expires' => $white_time, 'mask' => $mask, 'reason' => AUTOBAN_REASON_PASSED_CHALLENGE, 'notes' => $notes, 'status' => 1));
+    }
+    // To have reached here, the user has attempted to respond to a challenge
+    // if successful, then we'll have un-targetted them, and whitelisted them.
+    // if unsuccessful, we may have banned them, or else just decremented their
+    // counter so we'll ban them next time.
+    // If they were an image type challenge, then we've even sent the data
+    // for the image, and just need to quit. Otherwise, we need to redirect to
+    // the page they were trying to view so that hook_boot challenges them again.
+    if($row->challenge == AUTOBAN_PLAIN_IMAGE || $row->challenge == AUTOBAN_JS_IMAGE) {
+      exit;
+    }
+
+    if(isset($_REQUEST['destination'])) {
+      drupal_goto(check_plain($_REQUEST['destination']));
+    } else {
+      // Don't know where to send them, so send them to the home page
+      drupal_goto('');
+    }
+  } else {
+    // If you're not on the hitlist, have a 404 not found :-)
+    // This is counted as a page view by Statistics, so spamming this trying
+    // to find something out will get you banned eventually.
+    drupal_not_found();
+  }
+  // Shouldn't probably get here...
+  return;
+}
+
+
+// This function returns a random scramble of letters. It can generate
+// strings of arbirary characters, or those that can be used in URLs.
+function _autoban_random_string($len = 0, $url = FALSE) {
+  $output = '';
+  if($url == FALSE) {
+    $characters = '! #$%&()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~';
+  } else {
+    $characters = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
+  }
+  if($len == 0) {
+    $len = rand(5,20);
+  }
+
+  for($i = 0; $i < $len; $i++) {
+    $char = rand(0,strlen($characters));
+    $output .= $characters[$char];
+  }
+
+  return $output;
+}
+
+// The following line is for Vim users - please don't delete it.
+// vim: set filetype=php expandtab tabstop=2 shiftwidth=2:
